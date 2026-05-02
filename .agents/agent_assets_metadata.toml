@@ -1,0 +1,14 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "dCvZZjfFWcG2-k7bY-Tw8"
+uri = "file://USAGE_GUIDE.md"
+type = "text"
+title = "Usage Guide"
+
+[[outputs]]
+id = "TxDfqTvfvNF2srT_L4LtP"
+uri = "file://DEPLOYMENT_GUIDE.md"
+type = "text"
+title = "Deployment Guide"
