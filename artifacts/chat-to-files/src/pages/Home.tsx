@@ -4,7 +4,7 @@ import { extractTextFromPdf } from "@/lib/pdfExtractor";
 import { buildZip, downloadBlob } from "@/lib/zipBuilder";
 import { Upload, FileText, FolderOpen, Download, RotateCcw, ChevronRight, ChevronDown, File } from "lucide-react";
 
-type AppState = "idle" | "parsing" | "results" | "error";
+type AppState = "idle" | "parsing" | "results" | "error" | "accumulating";
 
 interface TreeNode {
   name: string;
@@ -46,6 +46,17 @@ function buildTree(files: ParsedFile[]): TreeNode[] {
 
 function countLines(content: string) {
   return content.split("\n").length;
+}
+
+function mergeFiles(existing: ParsedFile[], newFiles: ParsedFile[]): ParsedFile[] {
+  const map = new Map<string, ParsedFile>();
+  for (const file of existing) {
+    map.set(file.path, file);
+  }
+  for (const file of newFiles) {
+    map.set(file.path, file);
+  }
+  return Array.from(map.values()).sort((a, b) => a.path.localeCompare(b.path));
 }
 
 function TreeNodeComponent({
@@ -118,6 +129,7 @@ function TreeNodeComponent({
 export default function Home() {
   const [appState, setAppState] = useState<AppState>("idle");
   const [files, setFiles] = useState<ParsedFile[]>([]);
+  const [accumulatedFiles, setAccumulatedFiles] = useState<ParsedFile[]>([]);
   const [error, setError] = useState<string>("");
   const [dragging, setDragging] = useState(false);
   const [showPaste, setShowPaste] = useState(false);
@@ -126,9 +138,11 @@ export default function Home() {
   const [sourceFileName, setSourceFileName] = useState("project");
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const processText = useCallback(async (text: string, name?: string) => {
+  const processText = useCallback(async (text: string, name?: string, merge = false) => {
     setAppState("parsing");
-    setSourceFileName(name ? name.replace(/\.[^.]+$/, "") : "project");
+    if (!merge) {
+      setSourceFileName(name ? name.replace(/\.[^.]+$/, "") : "project");
+    }
     try {
       const parsed = parseContent(text);
       if (parsed.length === 0) {
@@ -136,17 +150,28 @@ export default function Home() {
         setAppState("error");
         return;
       }
-      setFiles(parsed);
-      setAppState("results");
+      
+      if (merge) {
+        const merged = mergeFiles(accumulatedFiles, parsed);
+        setAccumulatedFiles(merged);
+        setFiles(merged);
+        setAppState("results");
+      } else {
+        setFiles(parsed);
+        setAccumulatedFiles(parsed);
+        setAppState("results");
+      }
     } catch (e) {
       setError(String(e));
       setAppState("error");
     }
-  }, []);
+  }, [accumulatedFiles]);
 
-  const processFile = useCallback(async (file: File) => {
+  const processFile = useCallback(async (file: File, merge = false) => {
     setAppState("parsing");
-    setSourceFileName(file.name.replace(/\.[^.]+$/, ""));
+    if (!merge) {
+      setSourceFileName(file.name.replace(/\.[^.]+$/, ""));
+    }
     try {
       let text: string;
       if (file.name.endsWith(".pdf") || file.type === "application/pdf") {
@@ -161,31 +186,40 @@ export default function Home() {
         setAppState("error");
         return;
       }
-      setFiles(parsed);
-      setAppState("results");
+      
+      if (merge) {
+        const merged = mergeFiles(accumulatedFiles, parsed);
+        setAccumulatedFiles(merged);
+        setFiles(merged);
+        setAppState("results");
+      } else {
+        setFiles(parsed);
+        setAccumulatedFiles(parsed);
+        setAppState("results");
+      }
     } catch (e) {
       setError(String(e));
       setAppState("error");
     }
-  }, []);
+  }, [accumulatedFiles]);
 
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
       e.preventDefault();
       setDragging(false);
       const file = e.dataTransfer.files[0];
-      if (file) processFile(file);
+      if (file) processFile(file, appState === "accumulating");
     },
-    [processFile]
+    [processFile, appState]
   );
 
   const handleFileChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
-      if (file) processFile(file);
+      if (file) processFile(file, appState === "accumulating");
       e.target.value = "";
     },
-    [processFile]
+    [processFile, appState]
   );
 
   const handleDownload = useCallback(async () => {
@@ -201,6 +235,21 @@ export default function Home() {
   const handleReset = useCallback(() => {
     setAppState("idle");
     setFiles([]);
+    setError("");
+    setPasteText("");
+    setShowPaste(false);
+  }, []);
+
+  const handleAddMore = useCallback(() => {
+    setAppState("accumulating");
+    setPasteText("");
+    setShowPaste(false);
+  }, []);
+
+  const handleStartFresh = useCallback(() => {
+    setAppState("idle");
+    setFiles([]);
+    setAccumulatedFiles([]);
     setError("");
     setPasteText("");
     setShowPaste(false);
@@ -353,6 +402,102 @@ export default function Home() {
           </div>
         )}
 
+        {/* ACCUMULATING STATE */}
+        {appState === "accumulating" && (
+          <div className="space-y-6">
+            <div className="bg-cyan-500/10 border border-cyan-500/20 rounded-xl p-6 space-y-3">
+              <p className="text-cyan-400 font-medium">Add more files to merge</p>
+              <p className="text-neutral-400 text-sm">
+                Upload another chat or paste text to add/edit files in your project. Duplicate file paths will be updated with the new content.
+              </p>
+            </div>
+
+            {/* Drop zone for adding more */}
+            <div
+              data-testid="drop-zone-add"
+              onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={handleDrop}
+              onClick={() => fileInputRef.current?.click()}
+              className={`
+                relative border-2 border-dashed rounded-xl p-12 text-center cursor-pointer transition-all duration-200
+                ${dragging
+                  ? "border-cyan-400 bg-cyan-500/5 scale-[1.01]"
+                  : "border-white/10 hover:border-white/25 hover:bg-white/[0.02]"
+                }
+              `}
+            >
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".pdf,.txt,.md,.markdown"
+                onChange={handleFileChange}
+                className="hidden"
+                data-testid="file-input-add"
+              />
+              <div className="flex flex-col items-center gap-4">
+                <div className={`w-14 h-14 rounded-xl flex items-center justify-center border transition-colors
+                  ${dragging ? "bg-cyan-500/20 border-cyan-500/40" : "bg-white/5 border-white/10"}`}>
+                  <Upload size={24} className={dragging ? "text-cyan-400" : "text-neutral-400"} />
+                </div>
+                <div>
+                  <p className="text-white font-medium">Drop another file or click to browse</p>
+                  <p className="text-neutral-500 text-xs mt-2 font-mono">PDF &middot; TXT &middot; MD &middot; MARKDOWN</p>
+                </div>
+              </div>
+            </div>
+
+            {/* Paste area */}
+            <div className="space-y-3">
+              {!showPaste ? (
+                <button
+                  data-testid="btn-show-paste-add"
+                  onClick={() => setShowPaste(true)}
+                  className="w-full py-3 rounded-lg border border-white/10 text-neutral-400 text-sm font-mono hover:border-white/20 hover:text-neutral-200 transition-colors"
+                >
+                  Or paste text to add more files
+                </button>
+              ) : (
+                <div className="space-y-3">
+                  <textarea
+                    data-testid="paste-textarea-add"
+                    value={pasteText}
+                    onChange={(e) => setPasteText(e.target.value)}
+                    placeholder="Paste the next chatbot message to merge files..."
+                    className="w-full h-56 bg-neutral-900 border border-white/10 rounded-lg px-4 py-3 text-sm font-mono text-neutral-200 placeholder-neutral-600 resize-none focus:outline-none focus:border-cyan-500/50 focus:ring-1 focus:ring-cyan-500/20 transition-colors"
+                  />
+                  <div className="flex gap-2">
+                    <button
+                      data-testid="btn-merge-paste"
+                      disabled={!pasteText.trim()}
+                      onClick={() => processText(pasteText, undefined, true)}
+                      className="flex-1 py-2.5 rounded-lg bg-cyan-500 text-neutral-950 font-semibold text-sm hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                    >
+                      Merge files
+                    </button>
+                    <button
+                      data-testid="btn-cancel-paste-add"
+                      onClick={() => setShowPaste(false)}
+                      className="px-4 py-2.5 rounded-lg border border-white/10 text-neutral-400 text-sm hover:border-white/20 hover:text-neutral-200 transition-colors"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Back button */}
+            <button
+              data-testid="btn-back-results"
+              onClick={() => setAppState("results")}
+              className="w-full py-2.5 rounded-lg border border-white/10 text-neutral-400 text-sm hover:border-white/20 hover:text-neutral-200 transition-colors"
+            >
+              Back to results
+            </button>
+          </div>
+        )}
+
         {/* ERROR STATE */}
         {appState === "error" && (
           <div className="space-y-6">
@@ -384,12 +529,20 @@ export default function Home() {
               </div>
               <div className="flex items-center gap-3">
                 <button
-                  data-testid="btn-reset"
-                  onClick={handleReset}
+                  data-testid="btn-add-more"
+                  onClick={handleAddMore}
+                  className="flex items-center gap-2 px-3 py-2 rounded-lg border border-white/10 text-neutral-400 text-sm hover:border-white/20 hover:text-neutral-200 transition-colors"
+                >
+                  <Upload size={13} />
+                  Add more files
+                </button>
+                <button
+                  data-testid="btn-start-fresh"
+                  onClick={handleStartFresh}
                   className="flex items-center gap-2 px-3 py-2 rounded-lg border border-white/10 text-neutral-400 text-sm hover:border-white/20 hover:text-neutral-200 transition-colors"
                 >
                   <RotateCcw size={13} />
-                  New file
+                  Start over
                 </button>
                 <button
                   data-testid="btn-download"
