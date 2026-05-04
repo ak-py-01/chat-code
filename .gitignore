@@ -19,6 +19,7 @@ node_modules
 *.launch
 .settings/
 *.sublime-workspace
+.agents
 
 # IDE - VSCode
 .vscode/*
@@ -47,3 +48,7 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+replit.md
+.replit
+.replitignore
+DEPLOYMENT_GUIDE.md
