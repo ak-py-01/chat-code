@@ -1,0 +1,5 @@
+attached_assets/Pasted-I-cannot-directly-compile-and-hand-you-a-downloadable-a_1777743294859.txt
+artifacts/chat-to-files/index.html
+artifacts/mockup-sandbox/index.html
+artifacts/chat-to-files/public/favicon.svg
+artifacts/chat-to-files/public/opengraph.jpg
