@@ -1,10 +1,33 @@
 import { useState, useCallback, useRef } from "react";
-import { parseContent, type ParsedFile } from "@/lib/parser";
+import { getLanguageFromPath, normalizeFilePath, parseContentDetailed, type ParsedFile, type ParseIssue, type ParseResult } from "@/lib/parser";
 import { extractTextFromPdf } from "@/lib/pdfExtractor";
-import { buildZip, downloadBlob } from "@/lib/zipBuilder";
-import { Upload, FileText, FolderOpen, Download, RotateCcw, ChevronRight, ChevronDown, File } from "lucide-react";
+import { buildZip, downloadBlob, type HelperFile } from "@/lib/zipBuilder";
+import { Upload, FileText, FolderOpen, Download, RotateCcw, ChevronRight, ChevronDown, File, ClipboardCopy, Wrench, ShieldCheck, FileJson, TerminalSquare, AlertTriangle } from "lucide-react";
 
 type AppState = "idle" | "parsing" | "results" | "error" | "accumulating";
+
+const SAMPLE_INPUT = `### \`package.json\`
+\`\`\`json
+{
+  "scripts": {
+    "dev": "vite"
+  },
+  "dependencies": {}
+}
+\`\`\`
+
+\`\`\`tsx filename="src/App.tsx"
+export default function App() {
+  return <h1>Hello from chat-to-files</h1>;
+}
+\`\`\`
+
+// src/styles.css
+\`\`\`css
+body {
+  font-family: system-ui, sans-serif;
+}
+\`\`\``;
 
 interface TreeNode {
   name: string;
@@ -48,6 +71,154 @@ function countLines(content: string) {
   return content.split("\n").length;
 }
 
+function getTopFolders(files: ParsedFile[]) {
+  const folders = new Set<string>();
+  for (const file of files) {
+    const top = file.path.split("/")[0];
+    if (top && top !== file.path) folders.add(top);
+  }
+  return Array.from(folders).sort();
+}
+
+function buildTreeText(files: ParsedFile[]) {
+  return files.map((file) => file.path).sort().join("\n");
+}
+
+function shellQuote(value: string) {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function buildTerminalCommands(files: ParsedFile[]) {
+  return files
+    .map((file, index) => {
+      const dir = file.path.split("/").slice(0, -1).join("/");
+      const delimiter = `CHAT_TO_FILES_${index}`;
+      return [
+        dir ? `mkdir -p ${shellQuote(dir)}` : "",
+        `cat > ${shellQuote(file.path)} <<'${delimiter}'`,
+        file.content,
+        delimiter,
+      ].filter(Boolean).join("\n");
+    })
+    .join("\n\n");
+}
+
+function buildManifest(files: ParsedFile[], issues: ParseIssue[] = []) {
+  const languages = files.reduce<Record<string, number>>((acc, file) => {
+    acc[file.language] = (acc[file.language] || 0) + 1;
+    return acc;
+  }, {});
+
+  return JSON.stringify({
+    generatedAt: new Date().toISOString(),
+    fileCount: files.length,
+    totalLines: files.reduce((acc, file) => acc + countLines(file.content), 0),
+    languages,
+    topFolders: getTopFolders(files),
+    issues: issues.map((issue) => ({
+      type: issue.type,
+      path: issue.path,
+      rawPath: issue.rawPath,
+      message: issue.message,
+    })),
+    files: files.map((file) => ({
+      path: file.path,
+      language: file.language,
+      lines: countLines(file.content),
+      bytes: new Blob([file.content]).size,
+      confidence: file.confidence,
+      source: file.source,
+    })),
+  }, null, 2);
+}
+
+function buildRestoreCommands(files: ParsedFile[]) {
+  const directories = Array.from(
+    new Set(files.map((file) => file.path.split("/").slice(0, -1).join("/")).filter(Boolean))
+  ).sort();
+
+  const mkdirs = directories.length
+    ? directories.map((dir) => `mkdir -p ${JSON.stringify(dir)}`).join("\n")
+    : "# No nested directories detected";
+
+  return [
+    "#!/usr/bin/env bash",
+    "set -euo pipefail",
+    "",
+    "# Run this from the extracted zip root to make sure all folders exist.",
+    mkdirs,
+    "",
+    "echo \"Project scaffold is ready.\"",
+  ].join("\n");
+}
+
+function buildExtractionReport(files: ParsedFile[], issues: ParseIssue[] = []) {
+  const emptyFiles = files.filter((file) => file.content.trim().length === 0);
+  const largeFiles = files.filter((file) => countLines(file.content) > 500);
+  const missingLikelyEntrypoints = !files.some((file) =>
+    /(^|\/)(package\.json|pyproject\.toml|requirements\.txt|Cargo\.toml|go\.mod|pom\.xml|build\.gradle|vite\.config\.)/.test(file.path)
+  );
+
+  const checks = [
+    `Files extracted: ${files.length}`,
+    `Languages detected: ${new Set(files.map((file) => file.language)).size}`,
+    `Total lines: ${files.reduce((acc, file) => acc + countLines(file.content), 0).toLocaleString()}`,
+    emptyFiles.length ? `Empty files to inspect: ${emptyFiles.map((file) => file.path).join(", ")}` : "No empty files detected.",
+    largeFiles.length ? `Large files to review manually: ${largeFiles.map((file) => file.path).join(", ")}` : "No unusually large files detected.",
+    missingLikelyEntrypoints ? "No common dependency manifest was detected. If this is a runnable app, ask the AI assistant for the missing package/config files." : "A common dependency or build manifest was detected.",
+  ];
+
+  return [
+    "# Chat to Files Extraction Report",
+    "",
+    "## Checks",
+    "",
+    ...checks.map((check) => `- ${check}`),
+    "",
+    "## Parser Warnings",
+    "",
+    ...(issues.length ? issues.map((issue) => `- ${issue.message}`) : ["- No parser warnings."]),
+    "",
+    "## File Tree",
+    "",
+    "```text",
+    buildTreeText(files),
+    "```",
+    "",
+    "## Next Steps",
+    "",
+    "- Open the extracted folder in your editor.",
+    "- Review overwritten or regenerated files before running install commands.",
+    "- Run the project-specific package manager once dependency files are present.",
+  ].join("\n");
+}
+
+function buildReadme(files: ParsedFile[]) {
+  return [
+    "# Extracted Project",
+    "",
+    "This folder was generated by chat-to-files from AI chat output.",
+    "",
+    "## Contents",
+    "",
+    `- ${files.length} files`,
+    `- ${new Set(files.map((file) => file.language)).size} detected languages`,
+    `- ${files.reduce((acc, file) => acc + countLines(file.content), 0).toLocaleString()} total lines`,
+    "",
+    "See `CHAT_TO_FILES_REPORT.md` and `chat-to-files.manifest.json` for extraction details.",
+  ].join("\n");
+}
+
+function buildHelperFiles(files: ParsedFile[], issues: ParseIssue[] = []): HelperFile[] {
+  return [
+    { path: "README.extracted.md", content: buildReadme(files) },
+    { path: "CHAT_TO_FILES_REPORT.md", content: buildExtractionReport(files, issues) },
+    { path: "chat-to-files.manifest.json", content: buildManifest(files, issues) },
+    { path: "restore-folders.sh", content: buildRestoreCommands(files) },
+    { path: "create-files.sh", content: buildTerminalCommands(files) },
+  ];
+}
+
 function mergeFiles(existing: ParsedFile[], newFiles: ParsedFile[]): ParsedFile[] {
   const map = new Map<string, ParsedFile>();
   for (const file of existing) {
@@ -57,6 +228,32 @@ function mergeFiles(existing: ParsedFile[], newFiles: ParsedFile[]): ParsedFile[
     map.set(file.path, file);
   }
   return Array.from(map.values()).sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function buildCurrentWarnings(files: ParsedFile[], parseIssues: ParseIssue[]) {
+  const warnings = [...parseIssues];
+  const seen = new Set<string>();
+
+  for (const file of files) {
+    if (seen.has(file.path)) {
+      warnings.push({
+        type: "duplicate-path",
+        path: file.path,
+        message: `Duplicate path "${file.path}" exists in the current file list.`,
+      });
+    }
+    seen.add(file.path);
+
+    if (!file.content.trim()) {
+      warnings.push({
+        type: "empty-file",
+        path: file.path,
+        message: `"${file.path}" is empty.`,
+      });
+    }
+  }
+
+  return warnings;
 }
 
 function TreeNodeComponent({
@@ -130,13 +327,53 @@ export default function Home() {
   const [appState, setAppState] = useState<AppState>("idle");
   const [files, setFiles] = useState<ParsedFile[]>([]);
   const [accumulatedFiles, setAccumulatedFiles] = useState<ParsedFile[]>([]);
+  const [parseIssues, setParseIssues] = useState<ParseIssue[]>([]);
+  const [parseStats, setParseStats] = useState({ totalBlocks: 0, uncertainBlocks: 0 });
   const [error, setError] = useState<string>("");
   const [dragging, setDragging] = useState(false);
   const [showPaste, setShowPaste] = useState(false);
   const [pasteText, setPasteText] = useState("");
   const [downloading, setDownloading] = useState(false);
+  const [includeToolkit, setIncludeToolkit] = useState(true);
+  const [copyStatus, setCopyStatus] = useState("");
+  const [commandStatus, setCommandStatus] = useState("");
   const [sourceFileName, setSourceFileName] = useState("project");
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const applyParseResult = useCallback((result: ParseResult, merge: boolean) => {
+    if (result.files.length === 0) {
+      setError("No safe project files found. Make sure the content has fenced code blocks and project-relative file paths.");
+      setParseIssues(result.issues);
+      setParseStats({ totalBlocks: result.totalBlocks, uncertainBlocks: result.uncertainBlocks });
+      setAppState("error");
+      return;
+    }
+
+    if (merge) {
+      const overwritten = result.files
+        .filter((file) => accumulatedFiles.some((existing) => existing.path === file.path))
+        .map<ParseIssue>((file) => ({
+          type: "duplicate-path",
+          path: file.path,
+          message: `Merged content replaced existing "${file.path}".`,
+        }));
+      const merged = mergeFiles(accumulatedFiles, result.files);
+      setAccumulatedFiles(merged);
+      setFiles(merged);
+      setParseIssues((existing) => [...existing, ...result.issues, ...overwritten]);
+      setParseStats((existing) => ({
+        totalBlocks: existing.totalBlocks + result.totalBlocks,
+        uncertainBlocks: existing.uncertainBlocks + result.uncertainBlocks,
+      }));
+    } else {
+      setFiles(result.files);
+      setAccumulatedFiles(result.files);
+      setParseIssues(result.issues);
+      setParseStats({ totalBlocks: result.totalBlocks, uncertainBlocks: result.uncertainBlocks });
+    }
+    setError("");
+    setAppState("results");
+  }, [accumulatedFiles]);
 
   const processText = useCallback(async (text: string, name?: string, merge = false) => {
     setAppState("parsing");
@@ -144,28 +381,12 @@ export default function Home() {
       setSourceFileName(name ? name.replace(/\.[^.]+$/, "") : "project");
     }
     try {
-      const parsed = parseContent(text);
-      if (parsed.length === 0) {
-        setError("No code files found in the provided content. Make sure the file contains fenced code blocks with file path headers.");
-        setAppState("error");
-        return;
-      }
-      
-      if (merge) {
-        const merged = mergeFiles(accumulatedFiles, parsed);
-        setAccumulatedFiles(merged);
-        setFiles(merged);
-        setAppState("results");
-      } else {
-        setFiles(parsed);
-        setAccumulatedFiles(parsed);
-        setAppState("results");
-      }
+      applyParseResult(parseContentDetailed(text), merge);
     } catch (e) {
       setError(String(e));
       setAppState("error");
     }
-  }, [accumulatedFiles]);
+  }, [applyParseResult]);
 
   const processFile = useCallback(async (file: File, merge = false) => {
     setAppState("parsing");
@@ -180,28 +401,12 @@ export default function Home() {
       } else {
         text = await file.text();
       }
-      const parsed = parseContent(text);
-      if (parsed.length === 0) {
-        setError("No code files found in the provided content. Make sure the file contains fenced code blocks with file path headers.");
-        setAppState("error");
-        return;
-      }
-      
-      if (merge) {
-        const merged = mergeFiles(accumulatedFiles, parsed);
-        setAccumulatedFiles(merged);
-        setFiles(merged);
-        setAppState("results");
-      } else {
-        setFiles(parsed);
-        setAccumulatedFiles(parsed);
-        setAppState("results");
-      }
+      applyParseResult(parseContentDetailed(text), merge);
     } catch (e) {
       setError(String(e));
       setAppState("error");
     }
-  }, [accumulatedFiles]);
+  }, [applyParseResult]);
 
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
@@ -225,18 +430,74 @@ export default function Home() {
   const handleDownload = useCallback(async () => {
     setDownloading(true);
     try {
-      const blob = await buildZip(files);
+      const blob = await buildZip(files, includeToolkit ? buildHelperFiles(files, buildCurrentWarnings(files, parseIssues)) : []);
       downloadBlob(blob, `${sourceFileName}.zip`);
     } finally {
       setDownloading(false);
     }
-  }, [files, sourceFileName]);
+  }, [files, includeToolkit, parseIssues, sourceFileName]);
+
+  const handleDownloadReport = useCallback(() => {
+    downloadBlob(
+      new Blob([buildExtractionReport(files, buildCurrentWarnings(files, parseIssues))], { type: "text/markdown;charset=utf-8" }),
+      `${sourceFileName}-extraction-report.md`
+    );
+  }, [files, parseIssues, sourceFileName]);
+
+  const handleCopyTree = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(buildTreeText(files));
+      setCopyStatus("Copied file tree");
+      window.setTimeout(() => setCopyStatus(""), 1800);
+    } catch {
+      setCopyStatus("Clipboard unavailable");
+      window.setTimeout(() => setCopyStatus(""), 1800);
+    }
+  }, [files]);
+
+  const handleCopyCommands = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(buildTerminalCommands(files));
+      setCommandStatus("Copied commands");
+      window.setTimeout(() => setCommandStatus(""), 1800);
+    } catch {
+      setCommandStatus("Clipboard unavailable");
+      window.setTimeout(() => setCommandStatus(""), 1800);
+    }
+  }, [files]);
+
+  const handleRenameFile = useCallback((oldPath: string, rawPath: string) => {
+    const nextPath = normalizeFilePath(rawPath);
+    if (!nextPath) {
+      setError(`"${rawPath}" is not a safe project-relative path.`);
+      return;
+    }
+
+    if (nextPath !== oldPath && files.some((file) => file.path === nextPath)) {
+      setError(`"${nextPath}" already exists. Rename one of the duplicate files first.`);
+      return;
+    }
+
+    setError("");
+    const renamed = files
+      .map((file) => file.path === oldPath
+        ? { ...file, path: nextPath, language: getLanguageFromPath(nextPath), confidence: 100, source: "manual correction" }
+        : file
+      )
+      .sort((a, b) => a.path.localeCompare(b.path));
+    setFiles(renamed);
+    setAccumulatedFiles(renamed);
+  }, [files]);
 
   const handleReset = useCallback(() => {
     setAppState("idle");
     setFiles([]);
     setError("");
     setPasteText("");
+    setCopyStatus("");
+    setCommandStatus("");
+    setParseIssues([]);
+    setParseStats({ totalBlocks: 0, uncertainBlocks: 0 });
     setShowPaste(false);
   }, []);
 
@@ -252,10 +513,16 @@ export default function Home() {
     setAccumulatedFiles([]);
     setError("");
     setPasteText("");
+    setCopyStatus("");
+    setCommandStatus("");
+    setParseIssues([]);
+    setParseStats({ totalBlocks: 0, uncertainBlocks: 0 });
     setShowPaste(false);
   }, []);
 
   const tree = buildTree(files);
+  const warnings = buildCurrentWarnings(files, parseIssues);
+  const helperFiles = buildHelperFiles(files, warnings);
 
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100 flex flex-col">
@@ -343,13 +610,25 @@ export default function Home() {
                 </button>
               ) : (
                 <div className="space-y-3">
-                  <textarea
-                    data-testid="paste-textarea"
-                    value={pasteText}
-                    onChange={(e) => setPasteText(e.target.value)}
-                    placeholder={"Paste the full chatbot message here...\n\nThe parser will find file paths like:\n  ### `src/app.ts`\n  ```typescript\n  ...\n  ```"}
-                    className="w-full h-56 bg-neutral-900 border border-white/10 rounded-lg px-4 py-3 text-sm font-mono text-neutral-200 placeholder-neutral-600 resize-none focus:outline-none focus:border-cyan-500/50 focus:ring-1 focus:ring-cyan-500/20 transition-colors"
-                  />
+                  <div className="rounded-lg border border-white/10 bg-neutral-900 overflow-hidden">
+                    <textarea
+                      data-testid="paste-textarea"
+                      value={pasteText}
+                      onChange={(e) => setPasteText(e.target.value)}
+                      placeholder={"Paste the full chatbot message here...\n\nThe parser will find file paths like:\n  ### `src/app.ts`\n  ```typescript\n  ...\n  ```"}
+                      className="w-full h-56 bg-transparent px-4 py-3 text-sm font-mono text-neutral-200 placeholder-neutral-600 resize-none focus:outline-none"
+                    />
+                    <div className="px-4 py-2 border-t border-white/5 flex items-center justify-between gap-3 text-xs text-neutral-500">
+                      <span>Your pasted code is processed locally in your browser and is not uploaded.</span>
+                      <button
+                        data-testid="btn-sample-input"
+                        onClick={() => setPasteText(SAMPLE_INPUT)}
+                        className="text-cyan-400 hover:text-cyan-300 font-mono flex-shrink-0"
+                      >
+                        Use sample
+                      </button>
+                    </div>
+                  </div>
                   <div className="flex gap-2">
                     <button
                       data-testid="btn-parse-paste"
@@ -459,13 +738,25 @@ export default function Home() {
                 </button>
               ) : (
                 <div className="space-y-3">
-                  <textarea
-                    data-testid="paste-textarea-add"
-                    value={pasteText}
-                    onChange={(e) => setPasteText(e.target.value)}
-                    placeholder="Paste the next chatbot message to merge files..."
-                    className="w-full h-56 bg-neutral-900 border border-white/10 rounded-lg px-4 py-3 text-sm font-mono text-neutral-200 placeholder-neutral-600 resize-none focus:outline-none focus:border-cyan-500/50 focus:ring-1 focus:ring-cyan-500/20 transition-colors"
-                  />
+                  <div className="rounded-lg border border-white/10 bg-neutral-900 overflow-hidden">
+                    <textarea
+                      data-testid="paste-textarea-add"
+                      value={pasteText}
+                      onChange={(e) => setPasteText(e.target.value)}
+                      placeholder="Paste the next chatbot message to merge files..."
+                      className="w-full h-56 bg-transparent px-4 py-3 text-sm font-mono text-neutral-200 placeholder-neutral-600 resize-none focus:outline-none"
+                    />
+                    <div className="px-4 py-2 border-t border-white/5 flex items-center justify-between gap-3 text-xs text-neutral-500">
+                      <span>Your pasted code is processed locally in your browser and is not uploaded.</span>
+                      <button
+                        data-testid="btn-sample-input-add"
+                        onClick={() => setPasteText(SAMPLE_INPUT)}
+                        className="text-cyan-400 hover:text-cyan-300 font-mono flex-shrink-0"
+                      >
+                        Use sample
+                      </button>
+                    </div>
+                  </div>
                   <div className="flex gap-2">
                     <button
                       data-testid="btn-merge-paste"
@@ -520,14 +811,14 @@ export default function Home() {
         {appState === "results" && (
           <div className="space-y-6">
             {/* Summary bar */}
-            <div className="flex items-center justify-between">
+            <div className="flex items-start justify-between gap-4 flex-wrap">
               <div className="space-y-0.5">
                 <h2 className="text-white font-semibold text-lg">
                   Found {files.length} file{files.length !== 1 ? "s" : ""}
                 </h2>
                 <p className="text-neutral-500 text-sm font-mono">{sourceFileName}</p>
               </div>
-              <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2 flex-wrap justify-end">
                 <button
                   data-testid="btn-add-more"
                   onClick={handleAddMore}
@@ -543,6 +834,30 @@ export default function Home() {
                 >
                   <RotateCcw size={13} />
                   Start over
+                </button>
+                <button
+                  data-testid="btn-copy-tree"
+                  onClick={handleCopyTree}
+                  className="flex items-center gap-2 px-3 py-2 rounded-lg border border-white/10 text-neutral-400 text-sm hover:border-white/20 hover:text-neutral-200 transition-colors"
+                >
+                  <ClipboardCopy size={13} />
+                  {copyStatus || "Copy tree"}
+                </button>
+                <button
+                  data-testid="btn-copy-commands"
+                  onClick={handleCopyCommands}
+                  className="flex items-center gap-2 px-3 py-2 rounded-lg border border-white/10 text-neutral-400 text-sm hover:border-white/20 hover:text-neutral-200 transition-colors"
+                >
+                  <TerminalSquare size={13} />
+                  {commandStatus || "Copy commands"}
+                </button>
+                <button
+                  data-testid="btn-download-report"
+                  onClick={handleDownloadReport}
+                  className="flex items-center gap-2 px-3 py-2 rounded-lg border border-white/10 text-neutral-400 text-sm hover:border-white/20 hover:text-neutral-200 transition-colors"
+                >
+                  <FileJson size={13} />
+                  Report
                 </button>
                 <button
                   data-testid="btn-download"
@@ -562,8 +877,14 @@ export default function Home() {
               </div>
             </div>
 
+            {error && (
+              <div className="bg-red-500/10 border border-red-500/20 rounded-lg px-4 py-3 text-sm text-red-300">
+                {error}
+              </div>
+            )}
+
             {/* Stats row */}
-            <div className="flex gap-4">
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
               {[
                 { label: "Files", value: files.length },
                 { label: "Languages", value: new Set(files.map((f) => f.language)).size },
@@ -571,12 +892,97 @@ export default function Home() {
                   label: "Total lines",
                   value: files.reduce((acc, f) => acc + f.content.split("\n").length, 0).toLocaleString(),
                 },
+                { label: "Top folders", value: getTopFolders(files).length || "root" },
+                { label: "Confidence", value: `${Math.max(0, parseStats.totalBlocks - parseStats.uncertainBlocks)}/${parseStats.totalBlocks || files.length}` },
               ].map((stat) => (
-                <div key={stat.label} className="bg-neutral-900 border border-white/5 rounded-lg px-4 py-3 flex-1 text-center">
+                <div key={stat.label} className="bg-neutral-900 border border-white/5 rounded-lg px-4 py-3 text-center">
                   <p className="text-white font-semibold text-lg font-mono">{stat.value}</p>
                   <p className="text-neutral-500 text-xs mt-0.5">{stat.label}</p>
                 </div>
               ))}
+            </div>
+
+            <div className="bg-neutral-900 border border-white/5 rounded-xl overflow-hidden">
+              <div className="px-4 py-3 border-b border-white/5 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle size={14} className={warnings.length ? "text-amber-400" : "text-emerald-400"} />
+                  <span className="text-neutral-300 text-sm font-mono">
+                    Parser confidence
+                  </span>
+                </div>
+                <span className="text-xs text-neutral-500 font-mono">
+                  Detected {files.length} file{files.length !== 1 ? "s" : ""}, {parseStats.uncertainBlocks} uncertain block{parseStats.uncertainBlocks !== 1 ? "s" : ""}
+                </span>
+              </div>
+              <div className="p-4 space-y-2">
+                {warnings.length === 0 ? (
+                  <p className="text-sm text-neutral-400">No suspicious paths, duplicates, or empty files detected.</p>
+                ) : (
+                  warnings.map((issue, index) => (
+                    <div key={`${issue.type}-${issue.path || issue.rawPath || index}`} className="flex gap-2 text-sm text-amber-200">
+                      <AlertTriangle size={14} className="text-amber-400 mt-0.5 flex-shrink-0" />
+                      <span>{issue.message}</span>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+
+            {/* Toolbelt */}
+            <div className="bg-neutral-900 border border-white/5 rounded-xl overflow-hidden">
+              <div className="px-4 py-3 border-b border-white/5 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <Wrench size={14} className="text-cyan-400" />
+                  <span className="text-neutral-300 text-sm font-mono">Generated project tools</span>
+                </div>
+                <label className="flex items-center gap-2 text-xs text-neutral-400 cursor-pointer">
+                  <input
+                    data-testid="include-toolkit"
+                    type="checkbox"
+                    checked={includeToolkit}
+                    onChange={(e) => setIncludeToolkit(e.target.checked)}
+                    className="accent-cyan-500"
+                  />
+                  Include in zip
+                </label>
+              </div>
+              <div className="grid sm:grid-cols-2 gap-0 divide-y sm:divide-y-0 sm:divide-x divide-white/5">
+                {[
+                  {
+                    icon: <ShieldCheck size={15} className="text-emerald-400" />,
+                    title: "Extraction report",
+                    desc: "Flags empty files, very large files, missing dependency manifests, and next steps.",
+                  },
+                  {
+                    icon: <FileJson size={15} className="text-sky-400" />,
+                    title: "JSON manifest",
+                    desc: "Machine-readable inventory with paths, languages, line counts, folders, and byte sizes.",
+                  },
+                  {
+                    icon: <TerminalSquare size={15} className="text-violet-400" />,
+                    title: "Restore script",
+                    desc: "Creates the recovered folder structure from a terminal after extraction.",
+                  },
+                  {
+                    icon: <FileText size={15} className="text-amber-400" />,
+                    title: "Extracted README",
+                    desc: "Documents what was generated so the zip is understandable later.",
+                  },
+                ].map((tool) => (
+                  <div key={tool.title} className="p-4 flex gap-3">
+                    <div className="w-8 h-8 rounded bg-white/5 border border-white/10 flex items-center justify-center flex-shrink-0">
+                      {tool.icon}
+                    </div>
+                    <div>
+                      <p className="text-white text-sm font-medium">{tool.title}</p>
+                      <p className="text-neutral-500 text-xs leading-relaxed mt-1">{tool.desc}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="px-4 py-3 border-t border-white/5 text-xs text-neutral-500 font-mono">
+                {helperFiles.map((file) => file.path).join(" · ")}
+              </div>
             </div>
 
             {/* File tree */}
@@ -596,7 +1002,7 @@ export default function Home() {
             <div className="space-y-3">
               <h3 className="text-neutral-400 text-sm font-mono uppercase tracking-wider">File contents</h3>
               {files.map((file) => (
-                <FileCard key={file.path} file={file} />
+                <FileCard key={file.path} file={file} onRename={handleRenameFile} />
               ))}
             </div>
           </div>
@@ -606,9 +1012,11 @@ export default function Home() {
   );
 }
 
-function FileCard({ file }: { file: ParsedFile }) {
+function FileCard({ file, onRename }: { file: ParsedFile; onRename: (oldPath: string, nextPath: string) => void }) {
   const [expanded, setExpanded] = useState(false);
+  const [draftPath, setDraftPath] = useState(file.path);
   const lines = file.content.split("\n");
+  const confidence = file.confidence ?? 100;
 
   return (
     <div
@@ -623,6 +1031,13 @@ function FileCard({ file }: { file: ParsedFile }) {
           {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         </span>
         <span className="text-neutral-200 text-sm font-mono flex-1 truncate">{file.path}</span>
+        <span className={`text-xs px-2 py-0.5 rounded font-mono border flex-shrink-0 ${
+          confidence >= 90
+            ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+            : "bg-amber-500/10 text-amber-400 border-amber-500/20"
+        }`}>
+          {confidence}%
+        </span>
         <span className="text-xs px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-400 font-mono border border-cyan-500/20 flex-shrink-0">
           {file.language}
         </span>
@@ -630,6 +1045,30 @@ function FileCard({ file }: { file: ParsedFile }) {
       </button>
       {expanded && (
         <div className="border-t border-white/5">
+          <div className="px-4 py-3 border-b border-white/5 bg-neutral-950/30 space-y-2">
+            <label className="text-xs text-neutral-500 font-mono block">Correct filename before download</label>
+            <div className="flex gap-2">
+              <input
+                data-testid={`path-input-${file.path}`}
+                value={draftPath}
+                onChange={(e) => setDraftPath(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") onRename(file.path, draftPath);
+                }}
+                className="flex-1 bg-neutral-950 border border-white/10 rounded px-3 py-2 text-sm text-neutral-200 font-mono focus:outline-none focus:border-cyan-500/50"
+              />
+              <button
+                data-testid={`btn-rename-${file.path}`}
+                onClick={() => onRename(file.path, draftPath)}
+                className="px-3 py-2 rounded border border-white/10 text-neutral-300 text-sm hover:border-white/20 hover:text-white transition-colors"
+              >
+                Apply
+              </button>
+            </div>
+            <p className="text-xs text-neutral-600">
+              Source: {file.source || "detected"}.
+            </p>
+          </div>
           <pre className="overflow-x-auto px-4 py-3 text-xs font-mono text-neutral-300 bg-neutral-950/50 max-h-80 overflow-y-auto leading-relaxed">
             <code>{file.content}</code>
           </pre>

@@ -1,9 +1,17 @@
 import JSZip from "jszip";
 import type { ParsedFile } from "./parser";
 
-export async function buildZip(files: ParsedFile[]): Promise<Blob> {
+export interface HelperFile {
+  path: string;
+  content: string;
+}
+
+export async function buildZip(files: ParsedFile[], helperFiles: HelperFile[] = []): Promise<Blob> {
   const zip = new JSZip();
   for (const file of files) {
+    zip.file(file.path, file.content);
+  }
+  for (const file of helperFiles) {
     zip.file(file.path, file.content);
   }
   return zip.generateAsync({ type: "blob" });
